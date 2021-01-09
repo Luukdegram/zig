@@ -96,7 +96,8 @@ pub fn genCode(buf: *ArrayList(u8), decl: *Decl) !void {
     // TODO: check for and handle death of instructions
     for (mod_fn.body.instructions) |inst| {
         // skip load as they should be triggered by other instructions
-        if (inst.tag != .load) {
+        // as well as alloc as it has been handled above
+        if (inst.tag != .load and inst.tag != .alloc) {
             try genInst(buf, decl, inst);
         }
     }
@@ -117,7 +118,7 @@ fn genInst(buf: *ArrayList(u8), decl: *Decl, inst: *Inst) !void {
         .dbg_stmt => {},
         .ret => genRet(buf, decl, inst.castTag(.ret).?),
         .retvoid => {},
-        .alloc => {}, // already generated in 'genCode'
+        .alloc => unreachable, // already handled in 'genCode'
         .store => genStore(buf, decl, inst.castTag(.store).?),
         .load => genLoad(buf, decl, inst.castTag(.load).?),
         else => return error.TODOImplementMoreWasmCodegen,
@@ -181,8 +182,7 @@ fn genCall(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.Call) !void {
 }
 
 fn genStore(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.BinOp) !void {
-    const idx = decl.fn_link.wasm.?.getLocalidx(inst.lhs) orelse
-        return error.LocalDoesNotExist; // this is a developer error in the Zig compiler
+    const idx = decl.fn_link.wasm.?.getLocalidx(inst.lhs).?;
 
     const writer = buf.writer();
 
@@ -195,9 +195,7 @@ fn genStore(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.BinOp) !void {
 }
 
 fn genLoad(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.UnOp) !void {
-    const idx = decl.fn_link.wasm.?.getLocalidx(inst.operand) orelse
-        return error.LocalDoesNotExist; // this is a developer error in the Zig compiler
-
+    const idx = decl.fn_link.wasm.?.getLocalidx(inst.operand).?;
     const writer = buf.writer();
 
     // load the local at index `idx` onto the stack
