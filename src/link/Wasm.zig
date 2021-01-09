@@ -48,7 +48,12 @@ pub const FnData = struct {
     idx_refs: std.ArrayListUnmanaged(struct { offset: u32, decl: *Module.Decl }) = .{},
     /// A list of `Inst` used to save and retrieve the indices of local variables
     locals: std.ArrayListUnmanaged(*Inst) = .{},
+    /// Represents the scope of the current block that is being generated.
+    /// This is used to check during conditionals whether we should break or not
+    /// to exit a loop. The default is `func` as that's where codegen starts.
+    scope: enum { func, cond, loop } = .func,
 
+    /// list of generated `Inst` so they can be resolved at later stages
     /// Returns the index of a local given a pointer to an `Inst`
     pub fn getLocalidx(self: *FnData, inst: *Inst) ?u32 {
         return for (self.locals.items) |local, idx| {
@@ -119,6 +124,7 @@ pub fn updateDecl(self: *Wasm, module: *Module, decl: *Module.Decl) !void {
         fn_data.code.items.len = 0;
         fn_data.idx_refs.items.len = 0;
         fn_data.locals.items.len = 0;
+        fn_data.scope = .func;
     } else {
         decl.fn_link.wasm = .{};
         try self.funcs.append(self.base.allocator, decl);

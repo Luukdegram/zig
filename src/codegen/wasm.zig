@@ -7,7 +7,8 @@ const mem = std.mem;
 
 const Module = @import("../Module.zig");
 const Decl = Module.Decl;
-const Inst = @import("../ir.zig").Inst;
+const ir = @import("../ir.zig");
+const Inst = ir.Inst;
 const Type = @import("../type.zig").Type;
 const Value = @import("../value.zig").Value;
 
@@ -97,7 +98,7 @@ pub fn genCode(buf: *ArrayList(u8), decl: *Decl) !void {
     for (mod_fn.body.instructions) |inst| {
         // skip load as they should be triggered by other instructions
         // as well as alloc as it has been handled above
-        if (inst.tag != .load and inst.tag != .alloc) {
+        if (inst.tag != .load and inst.tag != .alloc and inst.tag != .add) {
             try genInst(buf, decl, inst);
         }
     }
@@ -111,17 +112,26 @@ pub fn genCode(buf: *ArrayList(u8), decl: *Decl) !void {
     leb.writeUnsignedFixed(5, buf.items[0..5], @intCast(u32, size));
 }
 
-fn genInst(buf: *ArrayList(u8), decl: *Decl, inst: *Inst) !void {
+fn genInst(buf: *ArrayList(u8), decl: *Decl, inst: *Inst) error{ OutOfMemory, TODOImplementMoreWasmCodegen }!void {
     return switch (inst.tag) {
+        .add => genAdd(buf, decl, inst.castTag(.add).?),
+        .alloc => unreachable, // already handled in 'genCode'
+        .block => genBlock(buf, decl, inst.castTag(.block).?),
+        .br => genBreak(buf, decl, inst.castTag(.br).?),
         .call => genCall(buf, decl, inst.castTag(.call).?),
+        .cmp_lt => genCmp(buf, decl, inst.castTag(.cmp_lt).?, .lt),
+        .condbr => genCondBr(buf, decl, inst.castTag(.condbr).?),
         .constant => genConstant(buf, decl, inst.castTag(.constant).?),
         .dbg_stmt => {},
+        .load => genLoad(buf, decl, inst.castTag(.load).?),
+        .loop => genLoop(buf, decl, inst.castTag(.loop).?),
         .ret => genRet(buf, decl, inst.castTag(.ret).?),
         .retvoid => {},
-        .alloc => unreachable, // already handled in 'genCode'
         .store => genStore(buf, decl, inst.castTag(.store).?),
-        .load => genLoad(buf, decl, inst.castTag(.load).?),
-        else => return error.TODOImplementMoreWasmCodegen,
+        else => {
+            std.debug.print("TODO: {s}", .{inst.tag});
+            return error.TODOImplementMoreWasmCodegen;
+        },
     };
 }
 
@@ -201,4 +211,111 @@ fn genLoad(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.UnOp) !void {
     // load the local at index `idx` onto the stack
     try writer.writeByte(0x20);
     try leb.writeULEB128(writer, idx);
+}
+
+fn genAdd(buf: *ArrayList(u8), decl: *Decl, inst: *Inst.BinOp) !void {
+    const ty = inst.base.ty;
+    // std.debug.print("{s}\n", .{inst.base.tag});
+    std.debug.print("{s} + {s}\n", .{ inst.lhs.tag, inst.rhs.tag });
+
+    try genInst(buf, decl, inst.lhs);
+    try genInst(buf, decl, inst.rhs);
+
+    const byte_code: u8 = switch (ty.tag()) {
+        .u32, .i32 => 0x6A, //i32.add
+        .u64, .i64 => 0x7C, //i64.add
+        .f32 => 0x92, //f32.add
+        .f64 => 0xA0, //f64.add
+        else => @panic("TODO: Implement more WASM types"),
+    };
+
+    try buf.append(byte_code);
+}
+
+fn genBlock(buf: *ArrayList(u8), decl: *Decl, block: *Inst.Block) !void {
+    try genBody(buf, decl, block.body);
+}
+
+fn genBody(buf: *ArrayList(u8), decl: *Decl, body: ir.Body) !void {
+    for (body.instructions) |inst| try genInst(buf, decl, inst);
+}
+
+fn genLoop(buf: *ArrayList(u8), decl: *Decl, loop: *Inst.Loop) !void {
+    const writer = buf.writer();
+
+    // set correct scope that we are generating code for
+    const scope = &decl.fn_link.wasm.?.scope;
+    const prev_scope = scope.*;
+    scope.* = .loop;
+
+    // begin a block (required to jump to)
+    try writer.writeByte(0x02);
+    // block type (void)
+    try writer.writeByte(0x40);
+
+    // begin a loop block
+    try writer.writeByte(0x03);
+    try writer.writeByte(0x40);
+
+    try genBody(buf, decl, loop.body);
+
+    // write .end byte to end loop
+    try writer.writeByte(0x0B);
+    // write .end byte to end initial block
+    try writer.writeByte(0x0B);
+
+    // return to old scope
+    scope.* = prev_scope;
+}
+
+fn genCmp(buf: *ArrayList(u8), decl: *Decl, cmp: *Inst.BinOp, op: std.math.CompareOperator) !void {
+    std.debug.print("Comparing: {s} < {s}\n", .{ cmp.lhs.tag, cmp.rhs.tag });
+    try genInst(buf, decl, cmp.lhs);
+    try genInst(buf, decl, cmp.rhs);
+
+    const ty = cmp.lhs.ty.tag();
+    std.debug.print("Ty: {s}\n", .{ty});
+    const byte_code: ?u8 = switch (op) {
+        .lt => @as(?u8, switch (ty) {
+            .i32 => 0x48, // i32.lt_s
+            .u32 => 0x49, // i32.lt_u
+            .i64 => 0x53, // i64.lt_s
+            .u64 => 0x54, // i64.lt_u
+            .f32 => 0x5D, // f32.lt
+            .f64 => 0x63, // f64.lt
+            else => null,
+        }),
+        else => null,
+    };
+
+    const byte_to_emit = byte_code orelse return error.TODOImplementMoreWasmCodegen;
+
+    try buf.append(byte_to_emit);
+}
+
+fn genCondBr(buf: *ArrayList(u8), decl: *Decl, condbr: *Inst.CondBr) !void {
+    const writer = buf.writer();
+    const current_scope = decl.fn_link.wasm.?.scope;
+
+    // if the scope is `loop` we need to break out if the condition equals to false
+    if (current_scope == .loop) {
+        // check if result equals '0' (i32.eqz)
+        try writer.writeByte(0x45);
+        // break if false (br_if)
+        try writer.writeByte(0x0D);
+        // break last block
+        try leb.writeULEB128(writer, @as(u32, 1));
+    }
+
+    try genBody(buf, decl, condbr.then_body);
+
+    if (current_scope == .loop) {
+        // break the loop so we jump back to the start
+        try writer.writeByte(0x0C);
+        try leb.writeULEB128(writer, @as(u32, 0));
+    }
+}
+
+fn genBreak(buf: *ArrayList(u8), decl: *Decl, br: *Inst.Br) !void {
+    std.debug.print("Break: ----\n{}\n", .{br});
 }
