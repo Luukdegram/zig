@@ -371,6 +371,7 @@ pub fn createEmpty(
     const output_mode = comp.config.output_mode;
     const shared_memory = comp.config.shared_memory;
     const wasi_exec_model = comp.config.wasi_exec_model;
+    const is_relocatable = output_mode == .Obj or (output_mode == .Lib and comp.config.link_mode == .Static);
 
     // If using LLD to link, this code should produce an object file so that it
     // can be passed to LLD.
@@ -389,7 +390,7 @@ pub fn createEmpty(
             .comp = comp,
             .emit = emit,
             .zcu_object_sub_path = zcu_object_sub_path,
-            .gc_sections = options.gc_sections orelse (output_mode != .Obj),
+            .gc_sections = options.gc_sections orelse (!is_relocatable),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse switch (target.os.tag) {
                 .freestanding => 1 * 1024 * 1024, // 1 MiB
@@ -450,7 +451,7 @@ pub fn createEmpty(
         const loc = try wasm.createSyntheticSymbol("__stack_pointer", .global);
         const symbol = loc.getSymbol(wasm);
         // For object files we will import the stack pointer symbol
-        if (output_mode == .Obj) {
+        if (is_relocatable) {
             symbol.setUndefined(true);
             symbol.index = @intCast(wasm.imported_globals_count);
             wasm.imported_globals_count += 1;
@@ -485,7 +486,7 @@ pub fn createEmpty(
             .limits = .{ .flags = 0, .min = 0, .max = undefined }, // will be overwritten during `mapFunctionTable`
             .reftype = .funcref,
         };
-        if (output_mode == .Obj or options.import_table) {
+        if (is_relocatable or options.import_table) {
             symbol.setUndefined(true);
             symbol.index = @intCast(wasm.imported_tables_count);
             wasm.imported_tables_count += 1;
@@ -955,6 +956,7 @@ fn writeI32Const(writer: anytype, val: u32) !void {
 }
 
 fn setupInitMemoryFunction(wasm: *Wasm) !void {
+    if (wasm.base.isRelocatable()) return;
     const comp = wasm.base.comp;
     const gpa = comp.gpa;
     const shared_memory = comp.config.shared_memory;
@@ -1365,8 +1367,7 @@ pub fn findGlobalSymbol(wasm: *Wasm, name: []const u8) ?SymbolLoc {
 }
 
 fn checkUndefinedSymbols(wasm: *const Wasm) !void {
-    const comp = wasm.base.comp;
-    if (comp.config.output_mode == .Obj) return;
+    if (wasm.base.isRelocatable()) return;
     if (wasm.import_symbols) return;
 
     var found_undefined_symbols = false;
@@ -1589,7 +1590,7 @@ fn mapFunctionTable(wasm: *Wasm) void {
         }
     }
 
-    if (wasm.import_table or wasm.base.comp.config.output_mode == .Obj) {
+    if (wasm.import_table or wasm.base.isRelocatable()) {
         const sym_loc = wasm.findGlobalSymbol("__indirect_function_table").?;
         const import = wasm.imports.getPtr(sym_loc).?;
         import.kind.table.limits.min = index - 1; // we start at index 1.
@@ -1685,12 +1686,11 @@ fn allocateVirtualAddresses(wasm: *Wasm) void {
         };
 
         const atom = wasm.getAtom(atom_index);
-        const merge_segment = wasm.base.comp.config.output_mode != .Obj;
         const segment_info = if (atom.file != .null)
             wasm.file(atom.file).?.segmentInfo()
         else
             wasm.segment_info.values();
-        const segment_name = segment_info[symbol.index].outputName(merge_segment);
+        const segment_name = segment_info[symbol.index].outputName(!wasm.base.isRelocatable());
         const segment_index = wasm.data_segments.get(segment_name).?;
         const segment = wasm.segments.items[segment_index];
 
@@ -2163,7 +2163,7 @@ fn checkExportNames(wasm: *Wasm) !void {
 fn setupExports(wasm: *Wasm) !void {
     const comp = wasm.base.comp;
     const gpa = comp.gpa;
-    if (comp.config.output_mode == .Obj) return;
+    if (wasm.base.isRelocatable()) return;
     log.debug("Building exports from symbols", .{});
 
     for (wasm.resolved_symbols.keys()) |sym_loc| {
@@ -2203,7 +2203,6 @@ fn setupExports(wasm: *Wasm) !void {
 }
 
 fn setupStart(wasm: *Wasm) !void {
-    const comp = wasm.base.comp;
     // do not export entry point if user set none or no default was set.
     const entry_name = wasm.entry_name orelse return;
 
@@ -2221,7 +2220,7 @@ fn setupStart(wasm: *Wasm) !void {
     }
 
     // Ensure the symbol is exported so host environment can access it
-    if (comp.config.output_mode != .Obj) {
+    if (!wasm.base.isRelocatable()) {
         symbol.setFlag(.WASM_SYM_EXPORTED);
     }
 }
@@ -2243,14 +2242,15 @@ fn setupMemory(wasm: *Wasm) !void {
         break :blk base;
     } else 0;
 
-    const is_obj = comp.config.output_mode == .Obj;
+    const is_relocatable = wasm.base.isRelocatable();
 
     const stack_ptr = if (wasm.findGlobalSymbol("__stack_pointer")) |loc| index: {
         const sym = loc.getSymbol(wasm);
+        if (sym.isUndefined()) break :index sym.index;
         break :index sym.index - wasm.imported_globals_count;
     } else null;
 
-    if (place_stack_first and !is_obj) {
+    if (place_stack_first and !is_relocatable) {
         memory_ptr = stack_alignment.forward(memory_ptr);
         memory_ptr += wasm.base.stack_size;
         // We always put the stack pointer global at index 0
@@ -2300,7 +2300,7 @@ fn setupMemory(wasm: *Wasm) !void {
         memory_ptr += 4;
     }
 
-    if (!place_stack_first and !is_obj) {
+    if (!place_stack_first and !is_relocatable) {
         memory_ptr = stack_alignment.forward(memory_ptr);
         memory_ptr += wasm.base.stack_size;
         if (stack_ptr) |index| {
@@ -2381,8 +2381,7 @@ pub fn getMatchingSegment(wasm: *Wasm, file_index: File.Index, symbol_index: Sym
     switch (symbol.tag) {
         .data => {
             const segment_info = obj_file.segmentInfo()[symbol.index];
-            const merge_segment = comp.config.output_mode != .Obj;
-            const result = try wasm.data_segments.getOrPut(gpa, segment_info.outputName(merge_segment));
+            const result = try wasm.data_segments.getOrPut(gpa, segment_info.outputName(!wasm.base.isRelocatable()));
             if (!result.found_existing) {
                 result.value_ptr.* = index;
                 var flags: u32 = 0;
@@ -2638,7 +2637,7 @@ fn writeToFile(
     var code_section_index: ?u32 = null;
     // Index of the data section. Used to tell relocation table where the section lives.
     var data_section_index: ?u32 = null;
-    const is_obj = comp.config.output_mode == .Obj or (!use_llvm and use_lld);
+    const is_relocatable = wasm.base.isRelocatable() or (!use_llvm and use_lld);
 
     var binary_bytes = std.ArrayList(u8).init(gpa);
     defer binary_bytes.deinit();
@@ -2689,7 +2688,7 @@ fn writeToFile(
         }
 
         if (import_memory) {
-            const mem_name = if (is_obj) "__linear_memory" else "memory";
+            const mem_name = if (is_relocatable) "__linear_memory" else "memory";
             const mem_imp: types.Import = .{
                 .module_name = try wasm.string_table.put(gpa, wasm.host_name),
                 .name = try wasm.string_table.put(gpa, mem_name),
@@ -2878,7 +2877,7 @@ fn writeToFile(
             const atom_index = wasm.symbol_atom.get(sym_loc).?;
             const atom = wasm.getAtomPtr(atom_index);
 
-            if (!is_obj) {
+            if (!is_relocatable) {
                 atom.resolveRelocs(wasm);
             }
             atom.offset = @intCast(binary_bytes.items.len - start_offset);
@@ -2928,7 +2927,7 @@ fn writeToFile(
             var current_offset: u32 = 0;
             while (true) {
                 const atom = wasm.getAtomPtr(atom_index);
-                if (!is_obj) {
+                if (!is_relocatable) {
                     atom.resolveRelocs(wasm);
                 }
 
@@ -2969,7 +2968,7 @@ fn writeToFile(
         section_count += 1;
     }
 
-    if (is_obj) {
+    if (is_relocatable) {
         // relocations need to point to the index of a symbol in the final symbol table. To save memory,
         // we never store all symbols in a single table, but store a location reference instead.
         // This means that for a relocatable object file, we need to generate one and provide it to the relocation sections.
@@ -3814,8 +3813,8 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
         try symbol_table.putNoClobber(sym_loc, symbol_count);
         symbol_count += 1;
         log.debug("Emit symbol: {}", .{symbol});
-        try leb.writeUleb128(writer, @intFromEnum(symbol.tag));
-        try leb.writeUleb128(writer, symbol.flags);
+        try leb.writeULEB128(writer, @intFromEnum(symbol.tag));
+        try leb.writeULEB128(writer, symbol.flags & ~@intFromEnum(Symbol.Flag.alive));
 
         const sym_name = sym_loc.getName(wasm);
         switch (symbol.tag) {

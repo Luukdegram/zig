@@ -378,7 +378,7 @@ fn finishUpdateDecl(
                 }
                 break :name ".bss.";
             } else ".rodata.";
-            if ((wasm_file.base.isObject() or wasm_file.base.comp.config.import_memory) and
+            if ((wasm_file.base.isRelocatable() or wasm_file.base.comp.config.import_memory) and
                 std.mem.startsWith(u8, segment_name, ".bss"))
             {
                 @memset(atom.code.items, 0);
