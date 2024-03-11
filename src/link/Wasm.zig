@@ -447,62 +447,31 @@ pub fn createEmpty(
     wasm.name = sub_path;
 
     // create stack pointer symbol
-    {
+    if (!is_relocatable) {
         const loc = try wasm.createSyntheticSymbol("__stack_pointer", .global);
         const symbol = loc.getSymbol(wasm);
-        // For object files we will import the stack pointer symbol
-        if (is_relocatable) {
-            symbol.setUndefined(true);
-            symbol.index = @intCast(wasm.imported_globals_count);
-            wasm.imported_globals_count += 1;
-            try wasm.imports.putNoClobber(
-                gpa,
-                loc,
-                .{
-                    .module_name = try wasm.string_table.put(gpa, wasm.host_name),
-                    .name = symbol.name,
-                    .kind = .{ .global = .{ .valtype = .i32, .mutable = true } },
-                },
-            );
-        } else {
-            symbol.index = @intCast(wasm.imported_globals_count + wasm.wasm_globals.items.len);
-            symbol.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
-            const global = try wasm.wasm_globals.addOne(gpa);
-            global.* = .{
-                .global_type = .{
-                    .valtype = .i32,
-                    .mutable = true,
-                },
-                .init = .{ .i32_const = 0 },
-            };
-        }
+        symbol.index = @intCast(wasm.imported_globals_count + wasm.wasm_globals.items.len);
+        symbol.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
+        const global = try wasm.wasm_globals.addOne(gpa);
+        global.* = .{
+            .global_type = .{
+                .valtype = .i32,
+                .mutable = true,
+            },
+            .init = .{ .i32_const = 0 },
+        };
     }
 
     // create indirect function pointer symbol
     {
         const loc = try wasm.createSyntheticSymbol("__indirect_function_table", .table);
         const symbol = loc.getSymbol(wasm);
-        const table: std.wasm.Table = .{
-            .limits = .{ .flags = 0, .min = 0, .max = undefined }, // will be overwritten during `mapFunctionTable`
-            .reftype = .funcref,
-        };
         if (is_relocatable or options.import_table) {
             symbol.setUndefined(true);
-            symbol.index = @intCast(wasm.imported_tables_count);
-            wasm.imported_tables_count += 1;
-            try wasm.imports.put(gpa, loc, .{
-                .module_name = try wasm.string_table.put(gpa, wasm.host_name),
-                .name = symbol.name,
-                .kind = .{ .table = table },
-            });
+        } else if (options.export_table) {
+            symbol.setFlag(.WASM_SYM_EXPORTED);
         } else {
-            symbol.index = @as(u32, @intCast(wasm.imported_tables_count + wasm.tables.items.len));
-            try wasm.tables.append(gpa, table);
-            if (wasm.export_table) {
-                symbol.setFlag(.WASM_SYM_EXPORTED);
-            } else {
-                symbol.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
-            }
+            symbol.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
         }
     }
 
@@ -561,12 +530,12 @@ pub fn createEmpty(
     if (comp.module) |zcu| {
         if (!use_llvm) {
             const index: File.Index = @enumFromInt(wasm.files.len);
-            var zig_object: ZigObject = .{
+            const zig_object: ZigObject = .{
                 .index = index,
                 .path = try std.fmt.allocPrint(gpa, "{s}.o", .{std.fs.path.stem(zcu.main_mod.root_src_path)}),
                 .stack_pointer_sym = .null,
             };
-            try zig_object.init(wasm);
+            errdefer gpa.free(zig_object.path);
             try wasm.files.append(gpa, .{ .zig_object = zig_object });
             wasm.zig_object_index = index;
         }
@@ -587,6 +556,17 @@ pub fn file(wasm: *const Wasm, index: File.Index) ?File {
 pub fn zigObjectPtr(wasm: *Wasm) ?*ZigObject {
     if (wasm.zig_object_index == .null) return null;
     return &wasm.files.items(.data)[@intFromEnum(wasm.zig_object_index)].zig_object;
+}
+
+/// Returns the index of the stack pointer symbol.
+/// Will create the symbol if it does not exist yet.
+/// Asserts a Zig Module exists.
+pub fn getStackPointer(wasm: *Wasm) !Symbol.Index {
+    const zig_object = wasm.zigObjectPtr().?;
+    if (zig_object.stack_pointer_sym == .null) {
+        try zig_object.createStackPointer(wasm);
+    }
+    return zig_object.stack_pointer_sym;
 }
 
 pub fn getTypeIndex(wasm: *const Wasm, func_type: std.wasm.Type) ?u32 {
@@ -1589,18 +1569,6 @@ fn mapFunctionTable(wasm: *Wasm) void {
             wasm.function_table.removeByPtr(entry.key_ptr);
         }
     }
-
-    if (wasm.import_table or wasm.base.isRelocatable()) {
-        const sym_loc = wasm.findGlobalSymbol("__indirect_function_table").?;
-        const import = wasm.imports.getPtr(sym_loc).?;
-        import.kind.table.limits.min = index - 1; // we start at index 1.
-    } else if (index > 1) {
-        log.debug("Appending indirect function table", .{});
-        const sym_loc = wasm.findGlobalSymbol("__indirect_function_table").?;
-        const symbol = sym_loc.getSymbol(wasm);
-        const table = &wasm.tables.items[symbol.index - wasm.imported_tables_count];
-        table.limits = .{ .min = index, .max = index, .flags = 0x1 };
-    }
 }
 
 /// From a given index, append the given `Atom` at the back of the linked list.
@@ -1958,6 +1926,22 @@ fn initializeTLSFunction(wasm: *Wasm) !void {
 fn setupImports(wasm: *Wasm) !void {
     const gpa = wasm.base.comp.gpa;
     log.debug("Merging imports", .{});
+
+    if ((wasm.import_table or wasm.base.isRelocatable()) and wasm.function_table.count() > 0) {
+        const loc = wasm.findGlobalSymbol("__indirect_function_count").?;
+        const symbol = loc.getSymbol(wasm);
+        symbol.index = @intCast(wasm.imported_tables_count);
+        wasm.imported_tables_count += 1;
+        try wasm.imports.put(gpa, loc, .{
+            .module_name = try wasm.string_table.put(gpa, wasm.host_name),
+            .name = symbol.name,
+            .kind = .{ .table = .{
+                .limits = .{ .flags = 0x0, .min = wasm.function_table.count(), .max = undefined },
+                .reftype = .funcref,
+            } },
+        });
+    }
+
     for (wasm.resolved_symbols.keys()) |symbol_loc| {
         const obj_file = wasm.file(symbol_loc.file) orelse {
             // Synthetic symbols will already exist in the `import` section
@@ -2029,6 +2013,23 @@ fn mergeSections(wasm: *Wasm) !void {
     var removed_duplicates = std.ArrayList(SymbolLoc).init(gpa);
     defer removed_duplicates.deinit();
 
+    // append the indirect function table if initialized
+    const function_pointers = wasm.function_table.count();
+    if (function_pointers > 0 and !wasm.import_table and !wasm.base.isRelocatable()) {
+        log.debug("Appending indirect function table", .{});
+        const loc = wasm.findGlobalSymbol("__indirect_function_table").?;
+        const symbol = loc.getSymbol(wasm);
+        symbol.index = @intCast(wasm.tables.items.len + wasm.imported_tables_count);
+        try wasm.tables.append(
+            gpa,
+            .{
+                // index starts at 1, so add 1 extra element
+                .limits = .{ .flags = 0x1, .min = function_pointers + 1, .max = function_pointers + 1 },
+                .reftype = .funcref,
+            },
+        );
+    }
+
     for (wasm.resolved_symbols.keys()) |sym_loc| {
         const obj_file = wasm.file(sym_loc.file) orelse {
             // Synthetic symbols already live in the corresponding sections.
@@ -2066,12 +2067,12 @@ fn mergeSections(wasm: *Wasm) !void {
                     }
                 }
                 gop.value_ptr.* = .{ .func = obj_file.function(sym_loc.index), .sym_index = sym_loc.index };
-                symbol.index = @as(u32, @intCast(gop.index)) + wasm.imported_functions_count;
+                symbol.index = @intCast(gop.index + wasm.imported_functions_count);
             },
             .global => {
                 const index = symbol.index - obj_file.importedFunctions();
                 const original_global = obj_file.globals()[index];
-                symbol.index = @as(u32, @intCast(wasm.wasm_globals.items.len)) + wasm.imported_globals_count;
+                symbol.index = @intCast(wasm.wasm_globals.items.len + wasm.imported_globals_count);
                 try wasm.wasm_globals.append(gpa, original_global);
             },
             .table => {
@@ -2079,7 +2080,7 @@ fn mergeSections(wasm: *Wasm) !void {
                 // assert it's a regular relocatable object file as `ZigObject` will never
                 // contain a table.
                 const original_table = obj_file.object.tables[index];
-                symbol.index = @as(u32, @intCast(wasm.tables.items.len)) + wasm.imported_tables_count;
+                symbol.index = @intCast(wasm.tables.items.len + wasm.imported_tables_count);
                 try wasm.tables.append(gpa, original_table);
             },
             .dead, .undefined => unreachable,
@@ -3863,8 +3864,8 @@ fn emitSegmentInfo(wasm: *Wasm, binary_bytes: *std.ArrayList(u8)) !void {
         });
         try leb.writeUleb128(writer, @as(u32, @intCast(segment_info.name.len)));
         try writer.writeAll(segment_info.name);
-        try leb.writeUleb128(writer, segment_info.alignment.toLog2Units());
-        try leb.writeUleb128(writer, segment_info.flags);
+        try leb.writeULEB128(writer, segment_info.alignment.toLog2Units());
+        try leb.writeULEB128(writer, segment_info.flags);
     }
 
     var buf: [5]u8 = undefined;

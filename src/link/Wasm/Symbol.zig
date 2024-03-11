@@ -200,8 +200,8 @@ pub fn format(symbol: Symbol, comptime fmt: []const u8, options: std.fmt.FormatO
     const undef: []const u8 = if (symbol.isUndefined()) "undefined" else "";
 
     try writer.print(
-        "{c} binding={s} visible={s} id={d} name_offset={d} {s}",
-        .{ kind_fmt, binding, visible, symbol.index, symbol.name, undef },
+        "{c} binding={s} visible={s} id={d} name_offset={d} {s} marked={}",
+        .{ kind_fmt, binding, visible, symbol.index, symbol.name, undef, symbol.isAlive() },
     );
 }
 

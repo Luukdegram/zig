@@ -116,17 +116,7 @@ const DeclInfo = struct {
     }
 };
 
-/// Initializes the `ZigObject` with initial symbols.
-pub fn init(zig_object: *ZigObject, wasm_file: *Wasm) !void {
-    // Initialize an undefined global with the name __stack_pointer. Codegen will use
-    // this to generate relocations when moving the stack pointer. This symbol will be
-    // resolved automatically by the final linking stage.
-    try zig_object.createStackPointer(wasm_file);
-
-    // TODO: Initialize debug information when we reimplement Dwarf support.
-}
-
-fn createStackPointer(zig_object: *ZigObject, wasm_file: *Wasm) !void {
+pub fn createStackPointer(zig_object: *ZigObject, wasm_file: *Wasm) !void {
     const gpa = wasm_file.base.comp.gpa;
     const sym_index = try zig_object.getGlobalSymbol(gpa, "__stack_pointer");
     const sym = zig_object.symbol(sym_index);
@@ -180,9 +170,11 @@ pub fn deinit(zig_object: *ZigObject, wasm_file: *Wasm) void {
         const atom_index = wasm_file.symbol_atom.get(.{ .file = zig_object.index, .index = sym_index }).?;
         wasm_file.getAtomPtr(atom_index).deinit(gpa);
     }
-    if (wasm_file.symbol_atom.get(.{ .file = zig_object.index, .index = zig_object.error_table_symbol })) |atom_index| {
-        const atom = wasm_file.getAtomPtr(atom_index);
-        atom.deinit(gpa);
+    if (zig_object.error_table_symbol != .null) {
+        if (wasm_file.symbol_atom.get(.{ .file = zig_object.index, .index = zig_object.error_table_symbol })) |atom_index| {
+            const atom = wasm_file.getAtomPtr(atom_index);
+            atom.deinit(gpa);
+        }
     }
     for (zig_object.synthetic_functions.items) |atom_index| {
         const atom = wasm_file.getAtomPtr(atom_index);
@@ -390,7 +382,7 @@ fn finishUpdateDecl(
             });
             errdefer gpa.free(full_segment_name);
             sym.tag = .data;
-            sym.index = try zig_object.createDataSegment(gpa, full_segment_name, decl.alignment);
+            sym.index = try zig_object.createDataSegment(gpa, full_segment_name, decl.getAlignment(mod));
         },
     }
     if (code.len == 0) return;

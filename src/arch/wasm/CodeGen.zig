@@ -1284,7 +1284,7 @@ fn genFunc(func: *CodeGen) InnerError!void {
         var prologue = std.ArrayList(Mir.Inst).init(func.gpa);
         defer prologue.deinit();
 
-        const sp = @intFromEnum(func.bin_file.zigObjectPtr().?.stack_pointer_sym);
+        const sp = @intFromEnum(try func.bin_file.getStackPointer());
         // load stack pointer
         try prologue.append(.{ .tag = .global_get, .data = .{ .label = sp } });
         // store stack pointer so we can restore it when we return from the function
@@ -1503,7 +1503,7 @@ fn restoreStackPointer(func: *CodeGen) !void {
     try func.emitWValue(func.initial_stack_value);
 
     // save its value in the global stack pointer
-    try func.addLabel(.global_set, @intFromEnum(func.bin_file.zigObjectPtr().?.stack_pointer_sym));
+    try func.addLabel(.global_set, @intFromEnum(try func.bin_file.getStackPointer()));
 }
 
 /// From a given type, will create space on the virtual stack to store the value of such type.
