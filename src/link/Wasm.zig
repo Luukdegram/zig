@@ -2526,6 +2526,9 @@ pub fn flushModule(wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id, prog_no
     const link_libcpp = comp.config.link_libcpp;
     const wasi_exec_model = comp.config.wasi_exec_model;
 
+    // --verbose-link
+    if (comp.verbose_link) try wasm.dumpArgv(comp);
+
     if (wasm.zigObjectPtr()) |zig_object| {
         try zig_object.flushModule(wasm, tid);
     }
@@ -4102,3 +4105,208 @@ fn defaultEntrySymbolName(wasi_exec_model: std.builtin.WasiExecModel) []const u8
         .command => "_start",
     };
 }
+
+const ErrorWithNotes = struct {
+    /// Allocated index in comp.link_errors array.
+    index: usize,
+
+    /// Next available note slot.
+    note_slot: usize = 0,
+
+    pub fn addMsg(
+        err: ErrorWithNotes,
+        wasm_file: *const Wasm,
+        comptime format: []const u8,
+        args: anytype,
+    ) error{OutOfMemory}!void {
+        const comp = wasm_file.base.comp;
+        const gpa = comp.gpa;
+        const err_msg = &comp.link_errors.items[err.index];
+        err_msg.msg = try std.fmt.allocPrint(gpa, format, args);
+    }
+
+    pub fn addNote(
+        err: *ErrorWithNotes,
+        wasm_file: *const Wasm,
+        comptime format: []const u8,
+        args: anytype,
+    ) error{OutOfMemory}!void {
+        const comp = wasm_file.base.comp;
+        const gpa = comp.gpa;
+        const err_msg = &comp.link_errors.items[err.index];
+        err_msg.notes[err.note_slot] = .{ .msg = try std.fmt.allocPrint(gpa, format, args) };
+        err.note_slot += 1;
+    }
+};
+
+pub fn addErrorWithNotes(wasm: *const Wasm, note_count: usize) error{OutOfMemory}!ErrorWithNotes {
+    const comp = wasm.base.comp;
+    const gpa = comp.gpa;
+    try comp.link_errors.ensureUnusedCapacity(gpa, 1);
+    return wasm.addErrorWithNotesAssumeCapacity(note_count);
+}
+
+pub fn addErrorWithoutNotes(wasm: *const Wasm, comptime fmt: []const u8, args: anytype) !void {
+    const err = try wasm.addErrorWithNotes(0);
+    try err.addMsg(wasm, fmt, args);
+}
+
+fn addErrorWithNotesAssumeCapacity(wasm: *const Wasm, note_count: usize) error{OutOfMemory}!ErrorWithNotes {
+    const comp = wasm.base.comp;
+    const gpa = comp.gpa;
+    const index = comp.link_errors.items.len;
+    const err = comp.link_errors.addOneAssumeCapacity();
+    err.* = .{ .msg = undefined, .notes = try gpa.alloc(link.File.ErrorMsg, note_count) };
+    return .{ .index = index };
+}
+
+/// --verbose-link output
+fn dumpArgv(wasm: *const Wasm, comp: *Compilation) !void {
+    const gpa = wasm.base.comp.gpa;
+    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const target = wasm.base.comp.root_mod.resolved_target.result;
+    const directory = wasm.base.emit.directory; // Just an alias to make it shorter to type.
+    const full_out_path = try directory.join(arena, &[_][]const u8{wasm.base.emit.sub_path});
+    const module_obj_path: ?[]const u8 = if (wasm.base.zcu_object_sub_path) |path| blk: {
+        if (fs.path.dirname(full_out_path)) |dirname| {
+            break :blk try fs.path.join(arena, &.{ dirname, path });
+        } else {
+            break :blk path;
+        }
+    } else null;
+
+    const compiler_rt_path: ?[]const u8 = blk: {
+        if (comp.compiler_rt_lib) |x| break :blk x.full_object_path;
+        if (comp.compiler_rt_obj) |x| break :blk x.full_object_path;
+        break :blk null;
+    };
+
+    var argv = std.ArrayList([]const u8).init(arena);
+
+    try argv.append(comp.self_exe_path.?);
+
+    if (wasm.base.isStaticLib()) {
+        try argv.append("ar");
+    } else {
+        try argv.append("ld");
+    }
+
+    if (wasm.base.isObject()) {
+        try argv.append("--relocatable");
+    }
+
+    try argv.append("-o");
+    try argv.append(full_out_path);
+
+    if (wasm.base.isRelocatable()) {
+        for (comp.objects) |obj| {
+            try argv.append(obj.path);
+        }
+
+        for (comp.c_object_table.keys()) |key| {
+            try argv.append(key.status.success.object_path);
+        }
+
+        if (module_obj_path) |p| {
+            try argv.append(p);
+        }
+    } else {
+        if (wasm.entry_name) |name| {
+            try argv.appendSlice(&.{ "--entry", name });
+        } else {
+            try argv.append("--no-entry");
+        }
+
+        try argv.appendSlice(&.{
+            "-z",
+            try std.fmt.allocPrint(arena, "stack-size={d}", .{wasm.base.stack_size}),
+        });
+
+        if (!wasm.base.gc_sections) {
+            try argv.append("--no-gc-sections");
+        }
+        if (wasm.global_base) |value| {
+            try argv.append(try std.fmt.allocPrint(arena, "--global-base={d}", .{value}));
+        } else {
+            try argv.append("--stack-first");
+        }
+        if (wasm.import_symbols) {
+            try argv.append("--allow-undefined");
+        }
+        if (comp.config.rdynamic) {
+            try argv.append("--export-dynamic");
+        }
+        if (wasm.import_table) {
+            try argv.append("--import-table");
+        }
+        if (wasm.export_table) {
+            try argv.append("--export-table");
+        }
+        if (comp.config.import_memory) {
+            try argv.append("--import-memory");
+        }
+        if (comp.config.export_memory) {
+            try argv.append("--export-memory");
+        }
+        for (wasm.export_symbol_names) |name| {
+            try argv.append(try std.fmt.allocPrint(arena, "--export={s}", .{name}));
+        }
+        if (wasm.initial_memory) |value| {
+            try argv.append(try std.fmt.allocPrint(arena, "--initial-memory={d}", .{value}));
+        }
+        if (wasm.max_memory) |value| {
+            try argv.append(try std.fmt.allocPrint(arena, "--max-memory={d}", .{value}));
+        }
+        if (comp.config.shared_memory) {
+            try argv.append("--shared-memory");
+        }
+        if (comp.config.debug_format == .strip) {
+            try argv.append("-s");
+        }
+
+        if (target.os.tag == .wasi) {
+            if (wasm.base.isExe() or wasm.base.isDynLib()) {
+                for (comp.wasi_emulated_libs) |crt_file| {
+                    try argv.append(try comp.get_libc_crt_file(
+                        arena,
+                        wasi_libc.emulatedLibCRFileLibName(crt_file),
+                    ));
+                }
+                if (comp.config.link_libc) {
+                    try argv.append(try comp.get_libc_crt_file(
+                        arena,
+                        wasi_libc.execModelCrtFileFullName(comp.config.wasi_exec_model),
+                    ));
+                    try argv.append(try comp.get_libc_crt_file(arena, "libc.a"));
+                }
+
+                if (comp.config.link_libcpp) {
+                    try argv.append(comp.libcxx_static_lib.?.full_object_path);
+                    try argv.append(comp.libcxxabi_static_lib.?.full_object_path);
+                }
+            }
+        }
+
+        for (comp.objects) |obj| {
+            try argv.append(obj.path);
+        }
+
+        for (comp.c_object_table.keys()) |key| {
+            try argv.append(key.status.success.object_path);
+        }
+
+        if (module_obj_path) |p| {
+            try argv.append(p);
+        }
+
+        if (compiler_rt_path) |p| {
+            try argv.append(p);
+        }
+    }
+
+    Compilation.dump_argv(argv.items);
+}
+>>>>>>> ccf7c88102 (wasm: support dumping linker line with verbose-link)
