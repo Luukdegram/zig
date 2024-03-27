@@ -1743,11 +1743,6 @@ fn setupInitFunctions(wasm: *Wasm) !void {
 
     // sort the initfunctions based on their priority
     mem.sort(InitFuncLoc, wasm.init_funcs.items, {}, InitFuncLoc.lessThan);
-
-    if (wasm.init_funcs.items.len > 0) {
-        const loc = wasm.findGlobalSymbol("__wasm_call_ctors").?;
-        try wasm.mark(loc);
-    }
 }
 
 /// Creates a function body for the `__wasm_call_ctors` symbol.
@@ -1928,7 +1923,7 @@ fn setupImports(wasm: *Wasm) !void {
     log.debug("Merging imports", .{});
 
     if ((wasm.import_table or wasm.base.isRelocatable()) and wasm.function_table.count() > 0) {
-        const loc = wasm.findGlobalSymbol("__indirect_function_count").?;
+        const loc = wasm.findGlobalSymbol("__indirect_function_table").?;
         const symbol = loc.getSymbol(wasm);
         symbol.index = @intCast(wasm.imported_tables_count);
         wasm.imported_tables_count += 1;
@@ -2687,6 +2682,7 @@ fn writeToFile(
         var it = wasm.imports.iterator();
         while (it.next()) |entry| {
             assert(entry.key_ptr.*.getSymbol(wasm).isUndefined());
+            assert(entry.key_ptr.getSymbol(wasm).isAlive());
             const import = entry.value_ptr.*;
             try wasm.emitImport(binary_writer, import);
         }
@@ -2931,7 +2927,11 @@ fn writeToFile(
             var current_offset: u32 = 0;
             while (true) {
                 const atom = wasm.getAtomPtr(atom_index);
-                if (!is_relocatable) {
+                if (is_relocatable) {
+                    // For relocatables, ensure we update the final index
+                    // the symbol points to.
+                    atom.symbolLoc().getSymbol(wasm).index = segment_count - 1;
+                } else {
                     atom.resolveRelocs(wasm);
                 }
 
@@ -2970,22 +2970,6 @@ fn writeToFile(
         );
         data_section_index = section_count;
         section_count += 1;
-    }
-
-    if (is_relocatable) {
-        // relocations need to point to the index of a symbol in the final symbol table. To save memory,
-        // we never store all symbols in a single table, but store a location reference instead.
-        // This means that for a relocatable object file, we need to generate one and provide it to the relocation sections.
-        var symbol_table = std.AutoArrayHashMap(SymbolLoc, u32).init(arena);
-        try wasm.emitLinkSection(&binary_bytes, &symbol_table);
-        if (code_section_index) |code_index| {
-            try wasm.emitCodeRelocations(&binary_bytes, code_index, symbol_table);
-        }
-        if (data_section_index) |data_index| {
-            try wasm.emitDataRelocations(&binary_bytes, data_index, symbol_table);
-        }
-    } else if (comp.config.debug_format != .strip) {
-        try wasm.emitNameSection(&binary_bytes, arena);
     }
 
     if (comp.config.debug_format != .strip) {
@@ -3042,16 +3026,42 @@ fn writeToFile(
             if (item.index) |index| {
                 var atom = wasm.getAtomPtr(wasm.atoms.get(index).?);
                 while (true) {
-                    atom.resolveRelocs(wasm);
+                    if (!is_relocatable) {
+                        atom.resolveRelocs(wasm);
+                    }
                     try debug_bytes.appendSlice(atom.code.items);
                     if (atom.prev == .null) break;
                     atom = wasm.getAtomPtr(atom.prev);
                 }
                 try emitDebugSection(&binary_bytes, debug_bytes.items, item.name);
                 debug_bytes.clearRetainingCapacity();
+
+                if (is_relocatable) {
+                    atom.symbolLoc().getSymbol(wasm).index = section_count;
+                }
+                section_count += 1;
             }
         }
+    }
 
+    if (is_relocatable) {
+        // relocations need to point to the index of a symbol in the final symbol table. To save memory,
+        // we never store all symbols in a single table, but store a location reference instead.
+        // This means that for a relocatable object file, we need to generate one and provide it to the relocation sections.
+        var symbol_table = std.AutoArrayHashMap(SymbolLoc, u32).init(arena);
+        try wasm.emitLinkSection(&binary_bytes, &symbol_table);
+        if (code_section_index) |code_index| {
+            try wasm.emitCodeRelocations(&binary_bytes, code_index, symbol_table);
+        }
+        if (data_section_index) |data_index| {
+            try wasm.emitDataRelocations(&binary_bytes, data_index, symbol_table);
+        }
+    } else if (comp.config.debug_format != .strip) {}
+
+    if (comp.config.debug_format != .strip) {
+        if (!is_relocatable) {
+            try wasm.emitNameSection(&binary_bytes, arena);
+        }
         try emitProducerSection(&binary_bytes);
         if (feature_count > 0) {
             try emitFeaturesSection(&binary_bytes, &enabled_features, feature_count);
@@ -3813,21 +3823,23 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
     var symbol_count: u32 = 0;
     for (wasm.resolved_symbols.keys()) |sym_loc| {
         const symbol = sym_loc.getSymbol(wasm).*;
-        if (symbol.tag == .dead) continue; // Do not emit dead symbols
+        if (symbol.isDead()) continue;
         try symbol_table.putNoClobber(sym_loc, symbol_count);
         symbol_count += 1;
-        log.debug("Emit symbol: {}", .{symbol});
-        try leb.writeULEB128(writer, @intFromEnum(symbol.tag));
+        assert(symbol.tag != .undefined and symbol.tag != .dead);
+        try leb.writeULEB128(writer, @as(u8, @intFromEnum(symbol.tag)));
         try leb.writeULEB128(writer, symbol.flags & ~@intFromEnum(Symbol.Flag.alive));
 
         const sym_name = sym_loc.getName(wasm);
+        log.debug("Emit symbol: \"{s}\" - {}", .{ sym_name, symbol });
         switch (symbol.tag) {
             .data => {
                 try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
                 try writer.writeAll(sym_name);
 
                 if (symbol.isDefined()) {
-                    try leb.writeUleb128(writer, symbol.index);
+                    std.debug.assert(symbol.index < wasm.segment_info.count());
+                    try leb.writeULEB128(writer, symbol.index);
                     const atom_index = wasm.symbol_atom.get(sym_loc).?;
                     const atom = wasm.getAtom(atom_index);
                     try leb.writeUleb128(writer, @as(u32, atom.offset));
@@ -3838,9 +3850,11 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
                 try leb.writeUleb128(writer, symbol.index);
             },
             else => {
-                try leb.writeUleb128(writer, symbol.index);
-                if (symbol.isDefined()) {
-                    try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
+                try leb.writeULEB128(writer, symbol.index);
+                if (symbol.isDefined() or
+                    (symbol.isUndefined() and symbol.hasFlag(.WASM_SYM_EXPLICIT_NAME)))
+                {
+                    try leb.writeULEB128(writer, @as(u32, @intCast(sym_name.len)));
                     try writer.writeAll(sym_name);
                 }
             },
@@ -4065,6 +4079,16 @@ fn markReferences(wasm: *Wasm) !void {
             const obj_file = wasm.file(sym_loc.file) orelse continue; // Incremental debug info is done independently
             _ = try obj_file.parseSymbolIntoAtom(wasm, sym_loc.index);
             sym.mark();
+        }
+    }
+
+    // set liveness of __wasm_call_ctors
+    if (wasm.findGlobalSymbol("__wasm_call_ctors")) |loc| {
+        const symbol = loc.getSymbol(wasm);
+        if (wasm.init_funcs.items.len > 0 and !wasm.base.isRelocatable()) {
+            symbol.mark();
+        } else {
+            symbol.unmark();
         }
     }
 }

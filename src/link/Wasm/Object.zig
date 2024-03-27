@@ -799,8 +799,8 @@ fn Parser(comptime ReaderType: type) type {
         /// requires access to `Object` to find the name of a symbol when it's
         /// an import and flag `WASM_SYM_EXPLICIT_NAME` is not set.
         fn parseSymbol(parser: *ObjectParser, gpa: Allocator, reader: anytype) !Symbol {
-            const tag = @as(Symbol.Tag, @enumFromInt(try leb.readUleb128(u8, reader)));
-            const flags = try leb.readUleb128(u32, reader);
+            const tag: Symbol.Tag = @enumFromInt(try leb.readULEB128(u8, reader));
+            const flags = try leb.readULEB128(u32, reader);
             var symbol: Symbol = .{
                 .flags = flags,
                 .tag = tag,
