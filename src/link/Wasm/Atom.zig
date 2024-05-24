@@ -77,7 +77,7 @@ pub fn resolveRelocs(atom: *Atom, wasm_bin: *const Wasm) void {
         log.debug("Relocating '{s}' referenced in '{s}' offset=0x{x:0>8} value={d}", .{
             (Wasm.SymbolLoc{ .file = atom.file, .index = @enumFromInt(reloc.index) }).getName(wasm_bin),
             symbol_name,
-            reloc.offset,
+            reloc.offset - atom.original_offset,
             value,
         });
 

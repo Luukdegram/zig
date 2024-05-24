@@ -382,7 +382,7 @@ fn finishUpdateDecl(
             });
             errdefer gpa.free(full_segment_name);
             sym.tag = .data;
-            sym.index = try zig_object.createDataSegment(gpa, full_segment_name, decl.getAlignment(mod));
+            sym.index = try zig_object.createDataSegment(gpa, full_segment_name, decl.getAlignment(pt));
         },
     }
     if (code.len == 0) return;

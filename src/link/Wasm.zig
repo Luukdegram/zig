@@ -371,7 +371,7 @@ pub fn createEmpty(
     const output_mode = comp.config.output_mode;
     const shared_memory = comp.config.shared_memory;
     const wasi_exec_model = comp.config.wasi_exec_model;
-    const is_relocatable = output_mode == .Obj or (output_mode == .Lib and comp.config.link_mode == .Static);
+    const is_relocatable = output_mode == .Obj or (output_mode == .Lib and comp.config.link_mode == .static);
 
     // If using LLD to link, this code should produce an object file so that it
     // can be passed to LLD.
@@ -2251,11 +2251,11 @@ fn setupMemory(wasm: *Wasm) !void {
         memory_ptr += wasm.base.stack_size;
         // We always put the stack pointer global at index 0
         if (stack_ptr) |index| {
-            wasm.wasm_globals.items[index].init.i32_const = @as(i32, @bitCast(@as(u32, @intCast(memory_ptr))));
+            wasm.wasm_globals.items[index].init.i32_const = @bitCast(@as(u32, @intCast(memory_ptr)));
         }
     }
 
-    var offset: u32 = @as(u32, @intCast(memory_ptr));
+    var offset: u32 = @intCast(memory_ptr);
     var data_seg_it = wasm.data_segments.iterator();
     while (data_seg_it.next()) |entry| {
         const segment = &wasm.segments.items[entry.value_ptr.*];
@@ -2292,7 +2292,7 @@ fn setupMemory(wasm: *Wasm) !void {
         const loc = try wasm.createSyntheticSymbol("__wasm_init_memory_flag", .data);
         const sym = loc.getSymbol(wasm);
         sym.mark();
-        sym.virtual_address = @as(u32, @intCast(memory_ptr));
+        sym.virtual_address = @intCast(memory_ptr);
         memory_ptr += 4;
     }
 
@@ -2300,7 +2300,7 @@ fn setupMemory(wasm: *Wasm) !void {
         memory_ptr = stack_alignment.forward(memory_ptr);
         memory_ptr += wasm.base.stack_size;
         if (stack_ptr) |index| {
-            wasm.wasm_globals.items[index].init.i32_const = @as(i32, @bitCast(@as(u32, @intCast(memory_ptr))));
+            wasm.wasm_globals.items[index].init.i32_const = @bitCast(@as(u32, @intCast(memory_ptr)));
         }
     }
 
@@ -2333,12 +2333,12 @@ fn setupMemory(wasm: *Wasm) !void {
     memory_ptr = mem.alignForward(u64, memory_ptr, std.wasm.page_size);
     // In case we do not import memory, but define it ourselves,
     // set the minimum amount of pages on the memory section.
-    wasm.memories.limits.min = @as(u32, @intCast(memory_ptr / page_size));
+    wasm.memories.limits.min = @intCast(memory_ptr / page_size);
     log.debug("Total memory pages: {d}", .{wasm.memories.limits.min});
 
     if (wasm.findGlobalSymbol("__heap_end")) |loc| {
         const symbol = loc.getSymbol(wasm);
-        symbol.virtual_address = @as(u32, @intCast(memory_ptr));
+        symbol.virtual_address = @intCast(memory_ptr);
     }
 
     if (wasm.max_memory) |max_memory| {
@@ -2354,7 +2354,7 @@ fn setupMemory(wasm: *Wasm) !void {
             var err = try wasm.base.addErrorWithNotes(0);
             try err.addMsg("Maximum memory exceeds maximum amount {d}", .{max_memory_allowed});
         }
-        wasm.memories.limits.max = @as(u32, @intCast(max_memory / page_size));
+        wasm.memories.limits.max = @intCast(max_memory / page_size);
         wasm.memories.limits.setFlag(.WASM_LIMITS_FLAG_HAS_MAX);
         if (shared_memory) {
             wasm.memories.limits.setFlag(.WASM_LIMITS_FLAG_IS_SHARED);
@@ -2880,10 +2880,13 @@ fn writeToFile(
             if (!is_relocatable) {
                 atom.resolveRelocs(wasm);
             }
+            try leb.writeULEB128(binary_writer, atom.size);
             atom.offset = @intCast(binary_bytes.items.len - start_offset);
-            try leb.writeUleb128(binary_writer, atom.size);
             try binary_writer.writeAll(atom.code.items);
         }
+
+        // ensure size is set so we can assert relocation offsets fit within the section when emitting a relocatable
+        wasm.segments.items[wasm.code_section_index.?].size = @intCast(binary_bytes.items.len - start_offset);
 
         try writeVecSectionHeader(
             binary_bytes.items,
@@ -2899,6 +2902,7 @@ fn writeToFile(
     // Data section
     if (data_segments_count != 0) {
         const header_offset = try reserveVecSectionHeader(&binary_bytes);
+        const start_offset = binary_bytes.items.len - 5;
 
         var it = wasm.data_segments.iterator();
         var segment_count: u32 = 0;
@@ -2931,31 +2935,34 @@ fn writeToFile(
                     // For relocatables, ensure we update the final index
                     // the symbol points to.
                     atom.symbolLoc().getSymbol(wasm).index = segment_count - 1;
+                    atom.offset = @intCast(binary_bytes.items.len - start_offset);
+                    try binary_writer.writeAll(atom.code.items);
+                    current_offset += atom.size;
+                    break; // relocatable object files have singular atoms per segment
                 } else {
                     atom.resolveRelocs(wasm);
-                }
-
-                // Pad with zeroes to ensure all segments are aligned
-                if (current_offset != atom.offset) {
-                    const diff = atom.offset - current_offset;
-                    try binary_writer.writeByteNTimes(0, diff);
-                    current_offset += diff;
-                }
-                assert(current_offset == atom.offset);
-                assert(atom.code.items.len == atom.size);
-                try binary_writer.writeAll(atom.code.items);
-
-                current_offset += atom.size;
-                if (atom.prev != .null) {
-                    atom_index = atom.prev;
-                } else {
-                    // also pad with zeroes when last atom to ensure
-                    // segments are aligned.
-                    if (current_offset != segment.size) {
-                        try binary_writer.writeByteNTimes(0, segment.size - current_offset);
-                        current_offset += segment.size - current_offset;
+                    // Pad with zeroes to ensure all segments are aligned
+                    if (current_offset != atom.offset) {
+                        const diff = atom.offset - current_offset;
+                        try binary_writer.writeByteNTimes(0, diff);
+                        current_offset += diff;
                     }
-                    break;
+                    assert(current_offset == atom.offset);
+                    assert(atom.code.items.len == atom.size);
+                    try binary_writer.writeAll(atom.code.items);
+
+                    current_offset += atom.size;
+                    if (atom.prev != .null) {
+                        atom_index = atom.prev;
+                    } else {
+                        // also pad with zeroes when last atom to ensure
+                        // segments are aligned.
+                        if (current_offset != segment.size) {
+                            try binary_writer.writeByteNTimes(0, segment.size - current_offset);
+                            current_offset += segment.size - current_offset;
+                        }
+                        break;
+                    }
                 }
             }
             assert(current_offset == segment.size);
@@ -3824,6 +3831,7 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
     for (wasm.resolved_symbols.keys()) |sym_loc| {
         const symbol = sym_loc.getSymbol(wasm).*;
         if (symbol.isDead()) continue;
+        if (symbol.tag == .table) continue;
         try symbol_table.putNoClobber(sym_loc, symbol_count);
         symbol_count += 1;
         assert(symbol.tag != .undefined and symbol.tag != .dead);
@@ -3838,12 +3846,12 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
                 try writer.writeAll(sym_name);
 
                 if (symbol.isDefined()) {
-                    std.debug.assert(symbol.index < wasm.segment_info.count());
+                    std.debug.assert(symbol.index < wasm.segment_info.count() + @intFromBool(wasm.code_section_index != null));
                     try leb.writeULEB128(writer, symbol.index);
                     const atom_index = wasm.symbol_atom.get(sym_loc).?;
                     const atom = wasm.getAtom(atom_index);
-                    try leb.writeUleb128(writer, @as(u32, atom.offset));
-                    try leb.writeUleb128(writer, @as(u32, atom.size));
+                    try leb.writeULEB128(writer, @as(u32, 0)); // always 0, as each symbol has its own segment
+                    try leb.writeULEB128(writer, @as(u32, atom.size));
                 }
             },
             .section => {
@@ -3872,8 +3880,9 @@ fn emitSegmentInfo(wasm: *Wasm, binary_bytes: *std.ArrayList(u8)) !void {
     try leb.writeUleb128(writer, @intFromEnum(types.SubsectionType.WASM_SEGMENT_INFO));
     const segment_offset = binary_bytes.items.len;
 
-    try leb.writeUleb128(writer, @as(u32, @intCast(wasm.segment_info.count())));
-    for (wasm.segment_info.values()) |segment_info| {
+    try leb.writeULEB128(writer, @as(u32, @intCast(wasm.segment_info.count())));
+    for (wasm.data_segments.values()) |segment_index| {
+        const segment_info = wasm.segment_info.get(segment_index).?;
         log.debug("Emit segment: {s} align({d}) flags({b})", .{
             segment_info.name,
             segment_info.alignment,
@@ -3909,7 +3918,7 @@ fn emitCodeRelocations(
     section_index: u32,
     symbol_table: std.AutoArrayHashMap(SymbolLoc, u32),
 ) !void {
-    const code_index = wasm.code_section_index orelse return;
+    if (wasm.functions.count() == 0) return;
     const writer = binary_bytes.writer();
     const header_offset = try reserveCustomSectionHeader(binary_bytes);
 
@@ -3921,28 +3930,25 @@ fn emitCodeRelocations(
     const reloc_start = binary_bytes.items.len;
 
     var count: u32 = 0;
-    var atom: *Atom = wasm.getAtomPtr(wasm.atoms.get(code_index).?);
-    // for each atom, we calculate the uleb size and append that
-    var size_offset: u32 = 5; // account for code section size leb128
-    while (true) {
-        size_offset += getUleb128Size(atom.size);
+    var func_it = wasm.functions.iterator();
+    while (func_it.next()) |entry| {
+        const sym_loc: SymbolLoc = .{ .index = entry.value_ptr.sym_index, .file = entry.key_ptr.file };
+        const atom_index = wasm.symbol_atom.get(sym_loc).?;
+        const atom = wasm.getAtomPtr(atom_index);
         for (atom.relocs.items) |relocation| {
             count += 1;
-            const sym_loc: SymbolLoc = .{ .file = atom.file, .index = @enumFromInt(relocation.index) };
-            const symbol_index = symbol_table.get(sym_loc).?;
-            try leb.writeUleb128(writer, @intFromEnum(relocation.relocation_type));
-            const offset = atom.offset + relocation.offset + size_offset;
-            try leb.writeUleb128(writer, offset);
-            try leb.writeUleb128(writer, symbol_index);
+            const symbol_index = symbol_table.get(.{ .index = @enumFromInt(relocation.index), .file = atom.file }).?;
+            try leb.writeULEB128(writer, @intFromEnum(relocation.relocation_type));
+            const offset = atom.offset + (relocation.offset - atom.original_offset);
+            assert(offset < wasm.segments.items[wasm.code_section_index.?].size);
+            try leb.writeULEB128(writer, offset);
+            try leb.writeULEB128(writer, symbol_index);
             if (relocation.relocation_type.addendIsPresent()) {
                 try leb.writeIleb128(writer, relocation.addend);
             }
             log.debug("Emit relocation: {}", .{relocation});
         }
-        if (atom.prev == .null) break;
-        atom = wasm.getAtomPtr(atom.prev);
     }
-    if (count == 0) return;
     var buf: [5]u8 = undefined;
     leb.writeUnsignedFixed(5, &buf, count);
     try binary_bytes.insertSlice(reloc_start, &buf);
@@ -3968,20 +3974,16 @@ fn emitDataRelocations(
     const reloc_start = binary_bytes.items.len;
 
     var count: u32 = 0;
-    // for each atom, we calculate the uleb size and append that
-    var size_offset: u32 = 5; // account for code section size leb128
     for (wasm.data_segments.values()) |segment_index| {
         var atom: *Atom = wasm.getAtomPtr(wasm.atoms.get(segment_index).?);
         while (true) {
-            size_offset += getUleb128Size(atom.size);
             for (atom.relocs.items) |relocation| {
                 count += 1;
                 const sym_loc: SymbolLoc = .{ .file = atom.file, .index = @enumFromInt(relocation.index) };
                 const symbol_index = symbol_table.get(sym_loc).?;
-                try leb.writeUleb128(writer, @intFromEnum(relocation.relocation_type));
-                const offset = atom.offset + relocation.offset + size_offset;
-                try leb.writeUleb128(writer, offset);
-                try leb.writeUleb128(writer, symbol_index);
+                try leb.writeULEB128(writer, @intFromEnum(relocation.relocation_type));
+                try leb.writeULEB128(writer, atom.offset + (relocation.offset - atom.original_offset));
+                try leb.writeULEB128(writer, symbol_index);
                 if (relocation.relocation_type.addendIsPresent()) {
                     try leb.writeIleb128(writer, relocation.addend);
                 }
@@ -3991,7 +3993,6 @@ fn emitDataRelocations(
             atom = wasm.getAtomPtr(atom.prev);
         }
     }
-    if (count == 0) return;
 
     var buf: [5]u8 = undefined;
     leb.writeUnsignedFixed(5, &buf, count);
@@ -4333,4 +4334,3 @@ fn dumpArgv(wasm: *const Wasm, comp: *Compilation) !void {
 
     Compilation.dump_argv(argv.items);
 }
->>>>>>> ccf7c88102 (wasm: support dumping linker line with verbose-link)
