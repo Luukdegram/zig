@@ -3937,7 +3937,14 @@ fn emitCodeRelocations(
         const atom = wasm.getAtomPtr(atom_index);
         for (atom.relocs.items) |relocation| {
             count += 1;
-            const symbol_index = symbol_table.get(.{ .index = @enumFromInt(relocation.index), .file = atom.file }).?;
+
+            // Type index relocations have the index point directly to the index within the list of types.
+            // To ensure it points to the merged list of types, retrieve the new index based on the type.
+            const symbol_index = if (relocation.relocation_type == .R_WASM_TYPE_INDEX_LEB) index: {
+                const reloc_file = wasm.file(sym_loc.file).?;
+                break :index wasm.getTypeIndex(reloc_file.funcTypes()[relocation.index]).?;
+            } else symbol_table.get(.{ .index = @enumFromInt(relocation.index), .file = atom.file }).?;
+
             try leb.writeULEB128(writer, @intFromEnum(relocation.relocation_type));
             const offset = atom.offset + (relocation.offset - atom.original_offset);
             assert(offset < wasm.segments.items[wasm.code_section_index.?].size);
